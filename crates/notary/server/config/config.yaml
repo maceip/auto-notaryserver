@@ -30,3 +30,7 @@ logging:
 authorization:
   enabled: false
   whitelist-csv-path: "./fixture/auth/whitelist.csv"
+
+domain: "notary.proof.codes"
+email: "mac@pse.dev"
+certcache: "."

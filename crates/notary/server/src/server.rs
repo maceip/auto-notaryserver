@@ -14,7 +14,7 @@ use notify::{
     event::ModifyKind, Error, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use p256::{ecdsa::SigningKey, pkcs8::DecodePrivateKey};
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls::ServerConfig;
 use std::{
     collections::HashMap,
     fs::File as StdFile,
@@ -42,34 +42,23 @@ use crate::{
     service::{initialize, upgrade_protocol},
     util::parse_csv_file,
 };
+use clap::Parser;
+use std::net::Ipv6Addr;
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
+use tokio_rustls_acme::caches::DirCache;
+use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig};
+use tokio_stream::StreamExt;
 
 /// Start a TCP server (with or without TLS) to accept notarization request for both TCP and WebSocket clients
 #[tracing::instrument(skip(config))]
 pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotaryServerError> {
-    // Load the private key for notarized transcript signing
+
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
     let notary_signing_key = load_notary_signing_key(&config.notary_key).await?;
-    // Build TLS acceptor if it is turned on
-    let tls_acceptor = if !config.tls.enabled {
-        debug!("Skipping TLS setup as it is turned off.");
-        None
-    } else {
-        let (tls_private_key, tls_certificates) = load_tls_key_and_cert(
-            &config.tls.private_key_pem_path,
-            &config.tls.certificate_pem_path,
-        )
-        .await?;
 
-        let mut server_config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(tls_certificates, tls_private_key)
-            .map_err(|err| eyre!("Failed to instantiate notary server tls config: {err}"))?;
-
-        // Set the http protocols we support
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls_config = Arc::new(server_config);
-        Some(TlsAcceptor::from(tls_config))
-    };
+    // Load the private key for notarized transcript signing
 
     // Load the authorization whitelist csv if it is turned on
     let authorization_whitelist =
@@ -116,8 +105,7 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
             .replace("{git_commit_timestamp}", &git_commit_timestamp)
             .replace("{public_key}", &public_key),
     );
-
-    let router = Router::new()
+    let router: Router = Router::new()
         .route(
             "/",
             get(|| async move { (StatusCode::OK, html_info).into_response() }),
@@ -155,62 +143,48 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
         .layer(CorsLayer::permissive())
         .with_state(notary_globals);
 
-    loop {
-        // Poll and await for any incoming connection, ensure that all operations inside are infallible to prevent bringing down the server
-        let stream = match poll_fn(|cx| Pin::new(&mut listener).poll_accept(cx)).await {
-            Ok((stream, _)) => stream,
-            Err(err) => {
-                error!("{}", NotaryServerError::Connection(err.to_string()));
-                continue;
+    let mut state = AcmeConfig::new([&config.domain])
+        .contact([&config.email].iter().map(|e| format!("mailto:{}", e)))
+        .cache_option(Some(DirCache::new(".")))
+        .directory_lets_encrypt(true)
+        .state();
+    let rustls_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(state.resolver());
+
+    let acceptor = state.acceptor();
+
+    tokio::spawn(async move {
+        loop {
+            match state.next().await.unwrap() {
+                Ok(ok) => log::info!("event: {:?}", ok),
+                Err(err) => log::error!("error: {:?}", err),
             }
-        };
-        debug!("Received a prover's TCP connection");
+        }
+    });
 
-        let tower_service = router.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let protocol = protocol.clone();
+    serve(acceptor, Arc::new(rustls_config),  config.server.port).await;
 
-        // Spawn a new async task to handle the new connection
+    Ok(())
+}
+
+async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u16) {
+    let listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port))
+        .await
+        .unwrap();
+    loop {
+        let tcp = listener.accept().await.unwrap().0;
+        let rustls_config = rustls_config.clone();
+        let accept_future = acceptor.accept(tcp);
+
         tokio::spawn(async move {
-            // When TLS is enabled
-            if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(stream).await {
-                    Ok(stream) => {
-                        info!("Accepted prover's TLS-secured TCP connection");
-                        // Reference: https://github.com/tokio-rs/axum/blob/5201798d4e4d4759c208ef83e30ce85820c07baa/examples/low-level-rustls/src/main.rs#L67-L80
-                        let io = TokioIo::new(stream);
-                        let hyper_service =
-                            hyper::service::service_fn(move |request: Request<Incoming>| {
-                                tower_service.clone().call(request)
-                            });
-                        // Serve different requests using the same hyper protocol and axum router
-                        let _ = protocol
-                            .serve_connection(io, hyper_service)
-                            // use with_upgrades to upgrade connection to websocket for websocket clients
-                            // and to extract tcp connection for tcp clients
-                            .with_upgrades()
-                            .await;
-                    }
-                    Err(err) => {
-                        error!("{}", NotaryServerError::Connection(err.to_string()));
-                    }
+            match accept_future.await.unwrap() {
+                None => log::info!("received TLS-ALPN-01 validation request"),
+                Some(start_handshake) => {
+                    let mut tls = start_handshake.into_stream(rustls_config).await.unwrap();
+                    //tls.write_all(HELLO).await.unwrap();
+                    tls.shutdown().await.unwrap();
                 }
-            } else {
-                // When TLS is disabled
-                info!("Accepted prover's TCP connection",);
-                // Reference: https://github.com/tokio-rs/axum/blob/5201798d4e4d4759c208ef83e30ce85820c07baa/examples/low-level-rustls/src/main.rs#L67-L80
-                let io = TokioIo::new(stream);
-                let hyper_service =
-                    hyper::service::service_fn(move |request: Request<Incoming>| {
-                        tower_service.clone().call(request)
-                    });
-                // Serve different requests using the same hyper protocol and axum router
-                let _ = protocol
-                    .serve_connection(io, hyper_service)
-                    // use with_upgrades to upgrade connection to websocket for websocket clients
-                    // and to extract tcp connection for tcp clients
-                    .with_upgrades()
-                    .await;
             }
         });
     }
@@ -234,30 +208,6 @@ pub async fn read_pem_file(file_path: &str) -> Result<BufReader<StdFile>> {
 }
 
 /// Load notary tls private key and cert from static files
-async fn load_tls_key_and_cert(
-    private_key_pem_path: &str,
-    certificate_pem_path: &str,
-) -> Result<(PrivateKey, Vec<Certificate>)> {
-    debug!("Loading notary server's tls private key and certificate");
-
-    let mut private_key_file_reader = read_pem_file(private_key_pem_path).await?;
-    let mut private_keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_file_reader)?;
-    ensure!(
-        private_keys.len() == 1,
-        "More than 1 key found in the tls private key pem file"
-    );
-    let private_key = PrivateKey(private_keys.remove(0));
-
-    let mut certificate_file_reader = read_pem_file(certificate_pem_path).await?;
-    let certificates = rustls_pemfile::certs(&mut certificate_file_reader)?
-        .into_iter()
-        .map(Certificate)
-        .collect();
-
-    debug!("Successfully loaded notary server's tls private key and certificate!");
-    Ok((private_key, certificates))
-}
-
 /// Load authorization whitelist if it is enabled
 fn load_authorization_whitelist(
     config: &NotaryServerProperties,
@@ -333,92 +283,4 @@ fn watch_and_reload_authorization_whitelist(
     };
     // Need to return the watcher to parent function, else it will be dropped and stop listening
     Ok(watcher)
-}
-
-#[cfg(test)]
-mod test {
-    use std::{fs::OpenOptions, time::Duration};
-
-    use csv::WriterBuilder;
-
-    use crate::AuthorizationProperties;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_load_notary_key_and_cert() {
-        let private_key_pem_path = "./fixture/tls/notary.key";
-        let certificate_pem_path = "./fixture/tls/notary.crt";
-        let result: Result<(PrivateKey, Vec<Certificate>)> =
-            load_tls_key_and_cert(private_key_pem_path, certificate_pem_path).await;
-        assert!(result.is_ok(), "Could not load tls private key and cert");
-    }
-
-    #[tokio::test]
-    async fn test_load_notary_signing_key() {
-        let config = NotarySigningKeyProperties {
-            private_key_pem_path: "./fixture/notary/notary.key".to_string(),
-            public_key_pem_path: "./fixture/notary/notary.pub".to_string(),
-        };
-        let result: Result<SigningKey> = load_notary_signing_key(&config).await;
-        assert!(result.is_ok(), "Could not load notary private key");
-    }
-
-    #[tokio::test]
-    async fn test_watch_and_reload_authorization_whitelist() {
-        // Clone fixture auth whitelist for testing
-        let original_whitelist_csv_path = "./fixture/auth/whitelist.csv";
-        let whitelist_csv_path = "./fixture/auth/whitelist_copied.csv".to_string();
-        std::fs::copy(original_whitelist_csv_path, &whitelist_csv_path).unwrap();
-
-        // Setup watcher
-        let config = NotaryServerProperties {
-            authorization: AuthorizationProperties {
-                enabled: true,
-                whitelist_csv_path,
-            },
-            ..Default::default()
-        };
-        let authorization_whitelist = load_authorization_whitelist(&config)
-            .expect("Authorization whitelist csv from fixture should be able to be loaded")
-            .as_ref()
-            .map(|whitelist| Arc::new(Mutex::new(whitelist.clone())));
-        let _watcher = watch_and_reload_authorization_whitelist(
-            config.clone(),
-            authorization_whitelist.as_ref().map(Arc::clone),
-        )
-        .expect("Watcher should be able to be setup successfully")
-        .expect("Watcher should be set up and not None");
-
-        // Sleep to buy a bit of time for hot reload task and watcher thread to run
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Write a new record to the whitelist to trigger modify event
-        let new_record = AuthorizationWhitelistRecord {
-            name: "unit-test-name".to_string(),
-            api_key: "unit-test-api-key".to_string(),
-            created_at: "unit-test-created-at".to_string(),
-        };
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&config.authorization.whitelist_csv_path)
-            .unwrap();
-        let mut wtr = WriterBuilder::new()
-            .has_headers(false) // Set to false to avoid writing header again
-            .from_writer(file);
-        wtr.serialize(new_record).unwrap();
-        wtr.flush().unwrap();
-
-        // Sleep to buy a bit of time for updated whitelist to be hot reloaded
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(authorization_whitelist
-            .unwrap()
-            .lock()
-            .unwrap()
-            .contains_key("unit-test-api-key"));
-
-        // Delete the cloned whitelist
-        std::fs::remove_file(&config.authorization.whitelist_csv_path).unwrap();
-    }
 }

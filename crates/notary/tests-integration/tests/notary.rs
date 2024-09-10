@@ -64,6 +64,11 @@ fn get_server_config(port: u16, tls_enabled: bool, auth_enabled: bool) -> Notary
             enabled: auth_enabled,
             whitelist_csv_path: "../server/fixture/auth/whitelist.csv".to_string(),
         },
+        domain: "contoso.com".to_owned(),
+        email: "test@contoso.com".to_owned(),
+        certcache: None,
+        
+        }
     }
 }
 

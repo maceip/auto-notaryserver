@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -15,6 +17,14 @@ pub struct NotaryServerProperties {
     pub logging: LoggingProperties,
     /// Setting for authorization
     pub authorization: AuthorizationProperties,
+    /// ACME registration
+    pub domain: String,
+    /// ACME contact
+    pub email: String,
+    /// ACME cert cache dir
+    pub certcache: Option<PathBuf>,
+
+
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
